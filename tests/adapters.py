@@ -9,6 +9,17 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from cs336_basics import bpe_tokenizer
+import heapq
+import re
+import regex
+from multiprocessing import Pool
+from collections import Counter,defaultdict
+
+from cs336_basics.bpe_tokenizer import BPETokenizer
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""" #GPT2 Regex
+compile_pat = regex.compile(PAT)
 
 def run_linear(
     d_in: int,
@@ -559,8 +570,117 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return BPETokenizer(vocab, merges, special_tokens=special_tokens)
 
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+# pre-tokenize chunk
+def process_chunk(
+    task:tuple,
+) -> dict:
+    input_path,start,end,special_tokens = task
+    try:
+        with open(input_path, "rb") as f:
+            f.seek(start)
+            chunk_bytes = f.read(end - start)
+            chunk_str = chunk_bytes.decode("utf-8",errors="ignore")
+    except Exception as e:
+        print(f"Reading Chunk {start}-{end}: {e}")
+        return defaultdict(int)
+    special_pattern_str = "|".join(re.escape(s) for s in special_tokens)
+    split_pattern = re.compile(f'({special_pattern_str})')
+
+    local_word_freqs = defaultdict(int)
+
+    if split_pattern and special_pattern_str:
+        text_parts = split_pattern.split(chunk_str)
+    else:
+        text_parts = [chunk_str]
+
+    for part in text_parts:
+        if not part:
+            continue
+
+        if part in special_tokens:
+            local_word_freqs[part] += 1
+        else:
+            for match in compile_pat.finditer(part):
+                local_word_freqs[match.group(0)] += 1
+
+    return local_word_freqs
+
+class HeapItem:
+    """
+    自定义堆条目类，以实现“最大堆”并处理平局规则。
+    heapq 是一个最小堆，所以我们反转比较逻辑：
+    A < B 应该返回 True 如果 A 具有 *更高* 的优先级。
+    """
+
+    def __init__(self, freq: int, pair: tuple[int, int], vocab: dict[int, bytes]):
+        self.freq = freq
+        self.pair = pair
+        # 预先计算用于平局比较的字节
+        self.pair_bytes = (vocab[pair[0]], vocab[pair[1]])
+
+    def __lt__(self, other: HeapItem) -> bool:
+        # __lt__ (less than) 应该返回 True 如果 self 的优先级 *高于* other
+        if self.freq != other.freq:
+            # 优先级1：频率。频率越高，优先级越高 ("less")
+            return self.freq > other.freq
+
+        # 优先级2：平局。字节字典序越大，优先级越高 ("less")
+        return self.pair_bytes > other.pair_bytes
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, HeapItem):
+            return False
+        return (self.freq == other.freq and
+                self.pair == other.pair and
+                self.pair_bytes == other.pair_bytes)
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -589,4 +709,124 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # initialize vocab with special_tokens and basic 256 byte
+    vocab = {i: bytes([i]) for i in range(256)}
+    current_id = 256
+    for token in special_tokens:
+        token_bytes = token.encode("utf-8")
+        vocab[current_id] = token_bytes
+        current_id += 1
+
+    # --- pre-tokenization stage ---
+
+    # divide raw_text into chunk
+    with open(input_path, "rb") as f:
+        num_processes = os.cpu_count()
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+
+    tasks = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if start < end:
+            tasks.append((input_path, start, end,special_tokens))
+    global_word_freqs = Counter()
+    with Pool(processes=num_processes) as pool:
+        for local_word_freqs in pool.imap_unordered(process_chunk, tasks):
+            global_word_freqs.update(local_word_freqs)
+
+    stats = {}  # dict[tuple[int],int]
+    inverted_index = {} # dict[int,set[tuple[int]]]
+    for word_str, freq in global_word_freqs.items():
+        if word_str in special_tokens:
+            continue
+        token_id_sequence = tuple(word_str.encode("utf-8"))
+        stats[token_id_sequence] = freq
+        for token_id in token_id_sequence:
+            inverted_index.setdefault(token_id, set()).add(token_id_sequence)
+
+    # --- bpe merge stage ---
+    merges = []
+    pair_freqs = defaultdict(int)
+    for token_id_sequence, freq in stats.items():
+        for pair in zip(token_id_sequence[:-1], token_id_sequence[1:]):
+            pair_freqs[pair] += freq
+
+    nums_merge = vocab_size - (current_id)
+
+    pq = [HeapItem(freq, pair, vocab) for pair, freq in pair_freqs.items() if freq > 0]
+    heapq.heapify(pq)
+
+
+    for i in range(nums_merge):
+
+        best_pair = None
+        while pq:
+            best_item = heapq.heappop(pq)
+            if best_item.freq == pair_freqs[best_item.pair]:
+                best_pair = best_item.pair
+                break
+        if not best_pair:
+            print("Priority queue is empty. Stopping early.")
+            break  #
+
+        new_token_id = current_id
+        current_id += 1
+        new_token_bytes = vocab[best_pair[0]] + vocab[best_pair[1]]
+        vocab[new_token_id] = new_token_bytes
+        merges.append((vocab[best_pair[0]], vocab[best_pair[1]]))
+
+        a,b = best_pair
+        seqs_with_a = inverted_index.get(a, set())
+        seqs_with_b = inverted_index.get(b, set())
+        relevant_seqs = list(seqs_with_a & seqs_with_b)
+
+        freq_deltas = defaultdict(int)
+        for seq in relevant_seqs:
+            seq_len = len(seq)
+            has_pair = False
+            for i in range(seq_len - 1):
+                if seq[i]==a and seq[i+1]==b:
+                    has_pair = True
+                    break
+            if not has_pair:
+                continue
+            freq = stats.pop(seq)
+            # 2. 修复 1: 将旧序列从 *所有* 相关索引中完全移除
+            for token_id in seq:
+                if token_id in inverted_index:  # 检查 token_id 是否还存在
+                    inverted_index[token_id].discard(seq)
+                    # (可选) 清理空集合
+                    if not inverted_index[token_id]:
+                        del inverted_index[token_id]
+            new_seq = []
+            i = 0
+            while i < seq_len:
+                if (i < seq_len - 1 and
+                        seq[i] == a and
+                        seq[i + 1] == b
+                ):
+                    new_seq.append(new_token_id)
+                    freq_deltas[best_pair] -= freq
+                    if i > 0:
+                        freq_deltas[(seq[i - 1], a)] -= freq
+                        freq_deltas[(seq[i - 1], new_token_id)] += freq
+                    if i < seq_len - 2:
+                        freq_deltas[(b, seq[i + 2])] -= freq
+                        freq_deltas[(new_token_id, seq[i + 2])] += freq
+                    i += 2
+                else :
+                    new_seq.append(seq[i])
+                    i += 1
+            new_seq_tuple = tuple(new_seq)
+            stats[new_seq_tuple] = freq
+            for token in new_seq:
+                inverted_index.setdefault(token, set()).add(new_seq_tuple)
+        for pair, change in freq_deltas.items():
+            pair_freqs[pair] = pair_freqs.get(pair, 0) + change
+            #    将新的频率推送到堆中
+            #    (我们不关心旧的、过时的条目)
+            if pair_freqs[pair] > 0:
+                heapq.heappush(pq, HeapItem(pair_freqs[pair], pair, vocab))
+        if best_pair in pair_freqs:
+            del pair_freqs[best_pair]
+
+    return vocab, merges
