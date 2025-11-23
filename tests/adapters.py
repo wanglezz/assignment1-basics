@@ -25,8 +25,11 @@ from Modules.rope import RotaryPositionalEmbedding
 from Modules.multi_self_attention import MutiHeadSelfAttention
 from Modules.transformer_block import TransformerBlock
 from Modules.transformer_lm import TransformerLM
+from Modules.adamw import AdamW
 
-from function import softmax,scaled_dot_product_attention,cross_entropy
+from function import (softmax,scaled_dot_product_attention,cross_entropy,
+                      learning_rate_schedule,gradient_clipping,data_loader,
+                      load_checkpoint,save_checkpoint)
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""" #GPT2 Regex
 compile_pat = regex.compile(PAT)
@@ -78,7 +81,7 @@ def run_embedding(
 
     embedding = Embedding(vocab_size,d_model)
     state_dict = {
-        "table": weights
+        "weight": weights
     }
     embedding.load_state_dict(state_dict)
     return embedding.forward(token_ids)
@@ -487,7 +490,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return data_loader(dataset=dataset,batch_size=batch_size,context_length=context_length,device=device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -533,14 +536,14 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    gradient_clipping(parameters=parameters,max_l2_norm=max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -568,7 +571,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return learning_rate_schedule(it=it,max_learning_rate=max_learning_rate,min_learning_rate=min_learning_rate,warmup_iters=warmup_iters,cosine_cycle_iters=cosine_cycle_iters)
 
 
 def run_save_checkpoint(
@@ -587,7 +590,8 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -608,7 +612,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(
@@ -634,7 +638,7 @@ def get_tokenizer(
     return BPETokenizer(vocab, merges, special_tokens=special_tokens)
 
 def find_chunk_boundaries(
-    file: BinaryIO,
+    file:BinaryIO,
     desired_num_chunks: int,
     split_special_token: bytes,
 ) -> list[int]:
@@ -815,7 +819,6 @@ def run_train_bpe(
 
     pq = [HeapItem(freq, pair, vocab) for pair, freq in pair_freqs.items() if freq > 0]
     heapq.heapify(pq)
-
 
     for i in range(nums_merge):
 

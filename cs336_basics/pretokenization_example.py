@@ -39,22 +39,22 @@ def save(
 if __name__ == '__main__':
 
     # input_path = os.path.join("..","tests","fixtures", "corpus.en")
-    # input_path = os.path.join("..","data","TinyStoriesV2-GPT4-train.txt")
-    input_path = os.path.join("..","data","owt_train.txt")
+    input_path = os.path.join("..","data","TinyStoriesV2-GPT4-train.txt")
+    # input_path = os.path.join("..","data","owt_train.txt")
 
-    pr = cProfile.Profile()
-    pr.enable()  # 开始记录
+    # pr = cProfile.Profile()
+    # pr.enable()  # 开始记录
     start_time = time.time()
     vocab,merges = run_train_bpe(input_path,
-    32000,
+    10000,
     special_tokens)
-    save(vocab,merges)
+    # save(vocab,merges)
     end_time = time.time()
     print(f"Time elapsed: {end_time - start_time}")
-    pr.disable()
+    # pr.disable()
     # 打印结果（通常使用 pstats 模块格式化输出）
-    stats = pstats.Stats(pr).sort_stats('cumulative')  # 按累积时间排序
-    stats.print_stats(10)  # 打印前 10 行
+    # stats = pstats.Stats(pr).sort_stats('cumulative')  # 按累积时间排序
+    # stats.print_stats(10)  # 打印前 10 行
 
 
 

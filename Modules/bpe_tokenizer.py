@@ -69,7 +69,7 @@ class BPETokenizer:
             vocab_filepath: Union[str, os.PathLike],
             merges_filepath: Union[str, os.PathLike],
             special_tokens: Optional[list[str]] = None
-    ) -> Self:  # 5. 返回类型使用 Self (或 "BPETokenizer")
+    ) -> Self:  # 返回类型使用 Self (或 "BPETokenizer")
         """
         从词汇表和合并规则文件加载 Tokenizer。
 
