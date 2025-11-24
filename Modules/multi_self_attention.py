@@ -17,7 +17,11 @@ class MutiHeadSelfAttention(nn.Module):
         self.v_proj = Linear(d_model,d_model)
         self.output_proj = Linear(d_model,d_model)
         self.rope = rope
-        self.mask = torch.tril(torch.ones(max_seq_len,max_seq_len,dtype=torch.bool))
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool)),
+            persistent=False
+        )
 
     def forward(self,x:torch.Tensor,token_positions=None) -> torch.Tensor:
         B,S,_ = x.shape
@@ -28,7 +32,11 @@ class MutiHeadSelfAttention(nn.Module):
         K = rearrange(K, "b s (h d_k) -> b h s d_k",h=self.nums_head)
         V = rearrange(V, "b s (h d_k) -> b h s d_k",h=self.nums_head)
         if self.rope is not None:
-            token_positions = torch.arange(S, device=x.device)
+            if token_positions is None:
+                token_positions = torch.arange(S, device=x.device)
+                # 确保外部传入的也是在正确的 device 上 (安全起见)
+            elif token_positions.device != x.device:
+                token_positions = token_positions.to(x.device)
             Q,K= self.rope(Q,token_positions),self.rope(K,token_positions)
         mask = self.mask[0:S,0:S]
         attention = scaled_dot_product_attention(Q, K, V,mask)
