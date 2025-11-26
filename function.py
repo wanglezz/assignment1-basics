@@ -5,6 +5,7 @@ import math
 from jaxtyping import Bool, Float, Int, Array
 from torch import Tensor
 import numpy.typing as npt
+from Modules.transformer_lm import TransformerLM
 
 def get_device():
     if torch.cuda.is_available():
@@ -95,17 +96,85 @@ def data_loader(
         dataset: npt.NDArray,
         batch_size: int,
         context_length: int,
-        device: str = 'mps'
+        device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     n = len(dataset)
-    index = torch.randint(n-context_length,(batch_size,))
+    
+    start_indices = np.random.randint(0, n - context_length, size=(batch_size,))
+    offsets = np.arange(context_length + 1)
+    indices = start_indices[:, None] + offsets
 
-    x = torch.stack([torch.from_numpy(dataset[i:i+context_length].astype(np.int64))for i in index])
-    y = torch.stack([torch.from_numpy(dataset[i+1:i+context_length+1].astype(np.int64))for i in index])
+    chunk = dataset[indices]
 
-    if device == "mps":
-        x,y = x.to(device),y.to(device)
-    return x,y
+    chunk_tensor = torch.from_numpy(chunk).to(device, non_blocking=True)
+    if chunk_tensor.dtype != torch.int64:
+        chunk_tensor = chunk_tensor.to(torch.int64)
+    
+    x = chunk_tensor[:, :-1]
+    y = chunk_tensor[:, 1:]
+    return x, y
+
+def decode(
+        model:TransformerLM,
+        prompt: Int[Tensor, "B T"],
+        maximum_num:Int,
+        p:Float,
+        temperature: float = 1.0,
+        eos_token_id: int = 256
+) -> Int[Tensor, " ..."]:
+    """
+    generate content with given prompt
+    """
+    # 主循环
+    # 将prompt喂给模型预测，获取logits
+    # 使用温度采样和top-p采样获取预测结果的token
+    # 将生成的token加入prompt继续训练直到遇到eof或者达到最大生成数量
+    model.eval()
+    iter_num = 0
+    finished = torch.zeros(prompt.shape[0],dtype=torch.bool,device=prompt.device)
+    with torch.no_grad():
+        while iter_num < maximum_num and not finished.all():
+            # 如果当前prompt超过最大上下文长度就截断
+            prompt_truncate = prompt if prompt.shape[1] <= model.context_length else prompt[:,-model.context_length:]
+            logits = model(prompt_truncate)
+            predict_token_logits = logits[:,-1,:] / temperature
+            distribution = softmax(predict_token_logits,dim=-1)
+            # 按行排序，累计求和
+            sorted_distribution,sorted_indices = torch.sort(distribution,descending=True)
+            cumulative_distr = torch.cumsum(sorted_distribution,dim=-1)
+            indices_to_remove = cumulative_distr > p
+            # 保留刚好>p的indice(右移一位)
+            indices_to_remove[...,1:] = indices_to_remove[...,:-1].clone()
+            indices_to_remove[...,0] = 0
+            # 重新排序
+            mask_in_original_order = torch.zeros_like(distribution, dtype=torch.bool)
+            mask_in_original_order.scatter_(dim=1, index=sorted_indices, src=indices_to_remove)
+            predict_token_logits[mask_in_original_order] = float('-inf')
+            new_distr = softmax(predict_token_logits,dim=-1)
+            next_token = torch.multinomial(new_distr,1)
+
+            # 1. 获取当前采样的 token 数值 (Shape: [B])
+            next_token_vals = next_token.squeeze(-1)
+            
+            # 2. 更新 finished 状态
+            # 如果某行这次生成了 EOS，就把它的 finished 设为 True
+            # 使用逻辑或 (|)，一旦变成 True 就永远是 True
+            finished = finished | (next_token_vals == eos_token_id)
+            
+            # 3. 处理“由于已经结束”而产生的无效 token
+            # 如果某一行在【上一轮】就已经 finished 了，
+            # 那么这一轮采样的结果是不重要的，我们强制把它覆盖为 EOS (作为 Padding)
+            # 这样输出的 Tensor 后面就是 neat 的 EOS, EOS, EOS...
+            # 注意：这里要把 finished 扩充维度变成 [B, 1] 才能和 next_token 操作
+            next_token = torch.where(
+                finished.unsqueeze(-1),      # 条件: 如果已经结束
+                torch.tensor(eos_token_id, device=prompt.device), # True: 填 EOS
+                next_token                   # False: 填原本采样结果
+            )
+
+            prompt = torch.cat((prompt,next_token),dim=1)
+            iter_num += 1
+    return prompt
 
 def save_checkpoint(model, optimizer, iteration, out):
     check_point = {

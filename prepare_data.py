@@ -35,8 +35,6 @@ def process(tokenizer):
 
             buffer = []  # 内存缓冲区
             token_count = 0
-
-            # 4. 调用你的 encode_iterable
             # 这里把 file_reader 生成器传进去，实现真正的流式
             # tqdm 用于显示进度 (total 只能估算，或者设为 None 仅仅显示速率)
             iterator = tokenizer.encode_iterable(file_reader(file_path))

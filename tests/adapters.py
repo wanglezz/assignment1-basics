@@ -785,17 +785,19 @@ def run_train_bpe(
     # --- pre-tokenization stage ---
 
     # divide raw_text into chunk
+    N_WORKERS = 16
+    N_CHUNKS = 64
     with open(input_path, "rb") as f:
-        num_processes = os.cpu_count()
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+        boundaries = find_chunk_boundaries(f, N_CHUNKS, b"<|endoftext|>")
 
     tasks = []
     for start, end in zip(boundaries[:-1], boundaries[1:]):
         if start < end:
             tasks.append((input_path, start, end,special_tokens))
     global_word_freqs = Counter()
-    with Pool(processes=num_processes) as pool:
-        for local_word_freqs in pool.imap_unordered(process_chunk, tasks):
+    with Pool(processes=N_WORKERS) as pool:
+        import tqdm 
+        for local_word_freqs in tqdm.tqdm(pool.imap_unordered(process_chunk, tasks), total=len(tasks)):
             global_word_freqs.update(local_word_freqs)
 
     stats = {}  # dict[tuple[int],int]

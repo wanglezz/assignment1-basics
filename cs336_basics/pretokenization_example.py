@@ -44,13 +44,13 @@ if __name__ == '__main__':
 
     # pr = cProfile.Profile()
     # pr.enable()  # 开始记录
-    start_time = time.time()
+    # start_time = time.time()
     vocab,merges = run_train_bpe(input_path,
     10000,
     special_tokens)
     # save(vocab,merges)
-    end_time = time.time()
-    print(f"Time elapsed: {end_time - start_time}")
+    # end_time = time.time()
+    # print(f"Time elapsed: {end_time - start_time}")
     # pr.disable()
     # 打印结果（通常使用 pstats 模块格式化输出）
     # stats = pstats.Stats(pr).sort_stats('cumulative')  # 按累积时间排序

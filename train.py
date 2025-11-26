@@ -18,23 +18,23 @@ def get_args():
 
     # 模型超参
     parser.add_argument('--vocab_size', type=int, default=10000)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--context_length', type=int, default=512, help='Context length')
-    parser.add_argument('--d_model', type=int, default=128, help='model dim')
-    parser.add_argument('--d_ff', type=int, default=512, help='ff dim')
-    parser.add_argument('--n_layer', type=int, default=6, help='Number of transformer layers')
-    parser.add_argument('--n_head', type=int, default=8)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--context_length', type=int, default=256, help='Context length')
+    parser.add_argument('--d_model', type=int, default=512, help='model dim')
+    parser.add_argument('--d_ff', type=int, default=1344, help='ff dim')
+    parser.add_argument('--n_layer', type=int, default=4, help='Number of transformer layers')
+    parser.add_argument('--n_head', type=int, default=16)
 
     # 训练超参
     parser.add_argument('--learning_rate', type=float, default=1e-3)
-    parser.add_argument('--max_iters', type=int, default=3000)
-    parser.add_argument('--eval_interval', type=int, default=200, help='How often to evaluate val loss')
+    parser.add_argument('--max_iters', type=int, default=4000)
+    parser.add_argument('--eval_interval', type=int, default=500, help='How often to evaluate val loss')
     parser.add_argument('--eval_iters', type=int, default=50, help='How many batches to verify')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps')
     parser.add_argument('--rope_theta', type=float, default=10000.0,
                         help='Base frequency for RoPE. Increase for longer context.')
-    parser.add_argument('--min_learning_rate', type=float, default=1e-4, help='通常设为 max_lr 的 10%')
-    parser.add_argument('--warmup_iters', type=int, default=100, help='预热步数，通常是前 100-1000 步')
+    parser.add_argument('--min_learning_rate', type=float, default=1e-4, help='Minimum learning rate for scheduler')
+    parser.add_argument('--warmup_iters', type=int, default=100, help='Number of warmup iterations')
     # WandB
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='transformer-project')
@@ -48,7 +48,7 @@ os.makedirs(args.out_dir, exist_ok=True)
 def get_data(spilt):
     data_path = os.path.join(args.data_dir,f"{spilt}.bin")
     data = np.memmap(data_path,dtype=np.uint16,mode='r')
-    return data_loader(data,args.batch_size,args.context_length)
+    return data_loader(data,args.batch_size,args.context_length,args.device)
 
 @torch.no_grad()
 def estimate_loss(model):
@@ -107,38 +107,50 @@ def train():
             losses = estimate_loss(model)
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-        if args.use_wandb:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": args.learning_rate,
-            })
+            if args.use_wandb:
+                current_time = time.time() - t0
+                wandb.log({
+                    "gradient_step": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "time/elapsed_seconds":current_time,
+                    "time/elapsed_hours":current_time / 3600,
+                })
         if iter_num % 1000 == 0 and iter_num > 0:
             print(f"Saving checkpoint to {args.out_dir}/{iter_num}.pt")
             save_checkpoint(model,optimizer,iter_num,os.path.join(args.out_dir, f'{iter_num}.pt'))
 
         # train
-        x,y = get_data('train')
-        logits = model(x)
-        loss = cross_entropy(logits,y)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-
+        accumulated_steps = 1
+        accumulated_loss = 0.0
+        for _ in range(accumulated_steps):
+            x,y = get_data('train')
+            logits = model(x)
+            loss = cross_entropy(logits,y)
+            loss_scaled = loss / accumulated_steps  # loss 归一化
+            loss_scaled.backward()
+            accumulated_loss += loss_scaled.item()
         gradient_clipping(model.parameters(),1.0)
-
         optimizer.step()
         if args.use_wandb:
+            current_time = time.time() - t0
             wandb.log({
-                "iter": iter_num,
-                "train/loss": loss.item(),
-                "lr": lr
+                "gradient_step": iter_num,
+                "train/loss": accumulated_loss,
+                "lr": lr,
+                "time/elapsed_seconds": current_time
             })
 
         if iter_num % 10 == 0:
             t1 = time.time()
             dt = (t1 - t0) * 1000  # 毫秒
-            print(f"step {iter_num} | loss {loss.item():.4f} | time {dt:.2f}ms")
+            tokens_num = args.batch_size * args.context_length * 10
+            tokens_per_sec = tokens_num / (t1 - t0)
+            if args.use_wandb:
+                wandb.log({"perf/tokens_per_sec": tokens_per_sec})
+            print(f"step {iter_num} | loss {loss.item():.4f} | time {dt:.2f}ms| {tokens_per_sec:.2f} tok/s")
             t0 = t1
 
         iter_num += 1

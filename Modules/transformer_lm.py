@@ -22,6 +22,14 @@ class TransformerLM(nn.Module):
                  rope:RotaryPositionalEmbedding = None):
         super().__init__()
 
+        # save hyperparameters
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+
         # token_embedding
         self.token_embeddings = Embedding(vocab_size,d_model)
 
