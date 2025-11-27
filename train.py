@@ -4,6 +4,7 @@ from sqlite3 import adapters
 import torch
 import numpy as np
 import argparse,yaml,os
+from contextlib import nullcontext
 from Modules.bpe_tokenizer import BPETokenizer
 from Modules.rope import RotaryPositionalEmbedding
 from Modules.transformer_lm import TransformerLM
@@ -30,11 +31,15 @@ def get_args():
     parser.add_argument('--max_iters', type=int, default=4000)
     parser.add_argument('--eval_interval', type=int, default=500, help='How often to evaluate val loss')
     parser.add_argument('--eval_iters', type=int, default=50, help='How many batches to verify')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps')
     parser.add_argument('--rope_theta', type=float, default=10000.0,
                         help='Base frequency for RoPE. Increase for longer context.')
     parser.add_argument('--min_learning_rate', type=float, default=1e-4, help='Minimum learning rate for scheduler')
     parser.add_argument('--warmup_iters', type=int, default=100, help='Number of warmup iterations')
+
+    # other
+    parser.add_argument('--use_fp16', action="store_true", help='use fp16')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps')
+
     # WandB
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='transformer-project')
@@ -58,8 +63,10 @@ def estimate_loss(model):
         losses = torch.zeros(args.eval_iters)
         for k in range(args.eval_iters):
             x,y = get_data(spilt)
-            logits,targets = model(x),y
-            loss = cross_entropy(logits,targets)
+            ctx = torch.amp.autocast(device_type='cuda', dtype=torch.float16) if args.use_fp16 else nullcontext()
+            with ctx:
+                logits = model(x) 
+                loss = cross_entropy(logits,y)
             losses[k] = loss.item()
         out[spilt] = losses.mean()
     model.train()
@@ -84,15 +91,23 @@ def train():
         )
     )
     model.to(args.device)
+    model = torch.compile(model)
+    if args.use_fp16:
+        print(">>> Mixed Precision (FP16) Enabled")
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        print(">>> Using Standard Precision (FP32)")
+        scaler = None
+    if args.use_wandb:
+        wandb.watch(model, log="all", log_freq=100)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"模型参数量: {n_params / 1e6:.2f}M")
 
     optimizer = AdamW(model.parameters(),lr=args.learning_rate)
 
-    best_val_loss = float('inf')
     iter_num = 0
     t0 = time.time()
-
+    start_time = time.time()
     while iter_num < args.max_iters:
         lr = learning_rate_schedule(
             it=iter_num,
@@ -108,7 +123,7 @@ def train():
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
             if args.use_wandb:
-                current_time = time.time() - t0
+                current_time = time.time() - start_time
                 wandb.log({
                     "gradient_step": iter_num,
                     "train/loss": losses['train'],
@@ -127,15 +142,28 @@ def train():
         accumulated_loss = 0.0
         for _ in range(accumulated_steps):
             x,y = get_data('train')
-            logits = model(x)
-            loss = cross_entropy(logits,y)
+            ctx = torch.amp.autocast(device_type='cuda',dtype=torch.float16) if args.use_fp16 else nullcontext()
+            with ctx:
+                logits = model(x)
+                loss = cross_entropy(logits,y)
             loss_scaled = loss / accumulated_steps  # loss 归一化
-            loss_scaled.backward()
+            if args.use_fp16:
+                scaler.scale(loss_scaled).backward()
+            else:
+                loss_scaled.backward()
             accumulated_loss += loss_scaled.item()
-        gradient_clipping(model.parameters(),1.0)
-        optimizer.step()
+        if args.use_fp16:
+            scaler.unscale_(optimizer)
+            gradient_clipping(model.parameters(),1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            gradient_clipping(model.parameters(),1.0)
+            optimizer.step()
+
+        # LOG
         if args.use_wandb:
-            current_time = time.time() - t0
+            current_time = time.time() - start_time
             wandb.log({
                 "gradient_step": iter_num,
                 "train/loss": accumulated_loss,
@@ -154,6 +182,7 @@ def train():
             t0 = t1
 
         iter_num += 1
+
 
 if __name__ == '__main__':
     train()

@@ -5,7 +5,6 @@ import math
 from jaxtyping import Bool, Float, Int, Array
 from torch import Tensor
 import numpy.typing as npt
-from Modules.transformer_lm import TransformerLM
 
 def get_device():
     if torch.cuda.is_available():
@@ -36,7 +35,7 @@ def scaled_dot_product_attention(
         "... seq_len_q d_k,... seq_len_k d_k -> ... seq_len_q seq_len_k"
     ) / math.sqrt(d_k)
     if mask is not None:
-        attention_scores = attention_scores.masked_fill(mask==False,-1e9)
+        attention_scores = attention_scores.masked_fill(mask==False,float('-inf'))
 
     attention_weights = softmax(attention_scores,dim=-1)
     attention = einsum(
@@ -115,7 +114,7 @@ def data_loader(
     return x, y
 
 def decode(
-        model:TransformerLM,
+        model:"TransformerLM",
         prompt: Int[Tensor, "B T"],
         maximum_num:Int,
         p:Float,
